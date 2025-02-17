@@ -2,7 +2,7 @@
 
 This repository contains a multi-step analysis pipeline for integrating RNA-seq and proteomics data from a study on mouse embryonic stem cell (mESC) differentiation. The workflow includes data preprocessing, differential expression analysis, protein versus RNA expression comparisons, and functional enrichment analysis using Gene Ontology (GO) and KEGG pathways.
 
-Files are .qmd at this exploratory stage where things are changed regularly for testing. Viewing, plotting and extensive comments will be removed once exploratory analysis is concluded.
+I use the .qmd files at this exploratory stage where things are changed regularly for testing. Viewing, plotting and extensive comments will be removed once exploratory analysis is concluded. The .R files are the same but without the modular output for each section.
 
 ## Project Structure
 
