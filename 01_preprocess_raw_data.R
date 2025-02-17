@@ -1,0 +1,232 @@
+
+# ------------------------------------------------------------------------------
+# Script: 01_preprocess_raw_data.qmd
+# Author: Luke
+#
+# Overview:
+#   Preprocesses raw RNA-seq and proteomics data by:
+#     - Filtering and processing RNA data.
+#     - Processing proteomics data (handling replicates, averaging, and
+#       computing Log2FC contrasts).
+#     - Matching common genes between the RNA and proteomics datasets.
+#
+# Inputs:
+#   - RNA data: translation_on_demand/counts/mm11_counts_mgi.csv
+#   - Proteomics data: /cellfile/cellnet/mESC_differentiation/translation_on_demand/data/mm9/raw/proteomic_data_raw.xlsx
+#
+# Outputs:
+#   - Processed RNA data: translation_on_demand/data/mm11/processed/processed_rna_data.rds
+#   - Processed proteomics data: translation_on_demand/data/mm11/processed/processed_prot_data.rds
+#   - Matched RNA data: translation_on_demand/data/mm11/processed/processed_rna_data_matched.rds
+# ------------------------------------------------------------------------------
+
+# -------------------------------
+# 01_load_preprocess_rna
+# -------------------------------
+# Set working directory and update library paths
+setwd('/cellfile/cellnet/mESC_differentiation')
+new_library_path <- "/cellfile/cellnet/mESC_differentiation/Rlibs/Rlibs_433_Fabian"
+.libPaths(c(new_library_path, .libPaths()))
+
+# Load required libraries
+library(tidyverse)
+library(readxl)
+
+# -------------------------------
+# Load RNA Data
+# -------------------------------
+rna_data <- read.csv("translation_on_demand/counts/mm11_counts_mgi.csv")
+
+# Summary statistics of each column
+summary(rna_data)
+
+# A concise overview of the data structure (using tidyverse)
+glimpse(rna_data)
+
+# -------------------------------
+# RNA DATA PROCESSING
+# -------------------------------
+# Process the RNA data in a single pipeline
+rna_data <- as_tibble(rna_data) %>%
+  # Remove genes with an empty mgi_symbol.
+  filter(mgi_symbol != "") %>%
+  # Remove genes with zero counts across all timepoints (columns starting with "X").
+  filter(rowSums(select(., starts_with("X"))) > 0) %>%
+  # Keep only genes with at least 10 counts in at least 2 timepoint columns.
+  filter(rowSums(select(., starts_with("X")) >= 10) >= 2) %>%
+  # Keep only protein_coding genes.
+  filter(gene_biotype == "protein_coding") %>%
+  # Keep only the mgi_symbol and timepoint columns.
+  select(mgi_symbol, starts_with("X"))
+
+# Print the number of genes after filtering for protein_coding.
+cat("After filtering for protein_coding, we have", nrow(rna_data), "genes.\n")
+
+# Print the number of duplicate mgi_symbols.
+cat("Number of duplicate mgi_symbols:", sum(duplicated(rna_data$mgi_symbol)), "\n")
+
+# Save the processed RNA data as an RDS file.
+saveRDS(rna_data, "translation_on_demand/data/mm11/processed/processed_rna_data.rds")
+
+# -------------------------------
+# Load Proteomics Data
+# -------------------------------
+prot_data <- suppressMessages(readxl::read_xlsx("/cellfile/cellnet/mESC_differentiation/translation_on_demand/data/mm9/raw/proteomic_data_raw.xlsx", sheet = "Raw Proteome Data"))
+
+# -------------------------------
+# Process Proteomics Data
+# -------------------------------
+# --- Step 1. Extract and remove the first row that contains replicate info ---
+rep_info <- prot_data[1, ]            # Save the first row (replicate info)
+prot_data <- prot_data[-1, ]           # Remove the first row from the data
+
+# Convert rep_info to a character vector for easier handling.
+rep_info <- as.character(unlist(rep_info))
+
+# --- Step 2. Create new column names ---
+# Get the original column names.
+orig_names <- colnames(prot_data)
+new_names <- orig_names  # start with a copy of the original names
+
+# Loop over intensity columns (columns 3 to 47).
+for (j in 3:length(new_names)) {
+  
+  # Determine the group number. 
+  # Each timepoint has 5 columns (4 replicates + 1 pooled), so:
+  group_index <- floor((j - 3) / 5) + 1
+  
+  # Determine the starting column index for this group.
+  group_start <- 3 + (group_index - 1) * 5
+  
+  # Use the original column name at the start of the group to get the timepoint label.
+  timepoint_label <- orig_names[group_start]
+  # Remove the trailing text " (Log2 LFQ Intensity)" (if present).
+  timepoint_label <- sub(" \\(Log2 LFQ Intensity\\)", "", timepoint_label)
+  
+  # Get the replicate label from the extracted rep_info for this column.
+  rep_label <- rep_info[j]
+  
+  # Create the new column name by combining the timepoint and replicate info.
+  new_names[j] <- paste0(timepoint_label, "_", rep_label)
+}
+
+# For columns 1 and 2 (IDs), keep the original names.
+# Now assign the new column names back to prot_data.
+colnames(prot_data) <- new_names
+
+# --- Step 3. Remove pooled columns ---
+# This drops any column that contains "Pooled" from the dataset.
+prot_data <- prot_data %>% 
+  select(-contains("Pooled"))
+
+# --- Step 4. Identify unique timepoints ---
+# Assume the first two columns are IDs. The remaining columns are in the form "TIMEPOINT_Replicate X".
+timepoints <- unique(gsub("_.*", "", colnames(prot_data)[-c(1,2)]))
+cat("Identified timepoints:", paste(timepoints, collapse = ", "), "\n")
+
+# --- Step 5. Count timepoints with sufficient replicates ---
+# For each gene (row), count how many timepoints have at least 2 non-NA replicate measurements.
+prot_data_filtered <- prot_data %>%
+  rowwise() %>%
+  mutate(
+    num_timepoints = sum(sapply(timepoints, function(tp) {
+      # Get replicate column names for the current timepoint
+      rep_cols <- colnames(prot_data)[grepl(paste0("^", tp, "_Replicate"), colnames(prot_data))]
+      # Extract the values for these replicate columns
+      vals <- c_across(all_of(rep_cols))
+      # Convert values to numeric and count non-NA values.
+      # If at least 2 replicates are non-NA, count this timepoint as detected (1); else 0.
+      if (sum(!is.na(as.numeric(vals))) >= 2) 1 else 0
+    }))
+  ) %>%
+  ungroup() %>%
+  # --- Step 6. Filter genes ---
+  # Keep genes that are detected (i.e., have >=2 valid replicates) in at least 5 timepoints.
+  filter(num_timepoints >= 5)
+
+cat("Filtered proteomics data has", nrow(prot_data_filtered), "genes.\n")
+
+# --- Remove the num_timepoints column if it exists ---
+if ("num_timepoints" %in% colnames(prot_data_filtered)) {
+  prot_data_filtered <- prot_data_filtered %>% select(-num_timepoints)
+}
+
+# --- Step 7. Convert replicate columns to numeric ---
+# Convert any column with "Replicate" in its name to numeric.
+prot_data_filtered <- prot_data_filtered %>%
+  mutate(across(contains("Replicate"), ~ as.numeric(trimws(.))))
+
+# --- Step 8. Identify unique timepoints ---
+# Exclude the first two ID columns; the remaining columns have names like "0m_Replicate 1"
+timepoints <- unique(gsub("_.*", "", colnames(prot_data_filtered)[-c(1,2)]))
+cat("Identified timepoints:", paste(timepoints, collapse = ", "), "\n")
+
+# --- Step 9. Compute average for each timepoint ---
+# For each timepoint, average the replicate columns if at least 2 replicates are non-NA,
+# otherwise assign NA. The new column is named exactly as the timepoint.
+for (tp in timepoints) {
+  new_col <- tp
+  # Identify replicate columns for this timepoint (e.g., "0m_Replicate 1", "0m_Replicate 2", etc.)
+  rep_cols <- colnames(prot_data_filtered)[grepl(paste0("^", tp, "_Replicate"), colnames(prot_data_filtered))]
+  
+  prot_data_filtered <- prot_data_filtered %>%
+    rowwise() %>%
+    mutate(!!new_col := {
+      vals <- c_across(all_of(rep_cols))
+      if (sum(!is.na(vals)) >= 2) {
+        mean(vals, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    }) %>%
+    ungroup()
+}
+
+# --- Step 10. Select final columns ---
+# Keep only the ID columns and the new timepoint columns.
+prot_data_final <- prot_data_filtered %>%
+  select(UniprotID, GeneID, all_of(timepoints))
+
+# --- Preview the final data ---
+print(head(prot_data_final))
+
+# --- Step 11. Calculate timepoint contrast ---
+# Compute Log2FC contrasts and add them as new columns.
+prot_data_contrasts <- prot_data_final %>%
+  mutate(
+    FC_0m_30m = `30m` - `0m`,
+    FC_30m_1h = `1h` - `30m`,
+    FC_1h_6h  = `6h` - `1h`,
+    FC_6h_12h = `12h` - `6h`,
+    FC_12h_24h = `24h` - `12h`,
+    FC_24h_36h = `36h` - `24h`,
+    FC_36h_48h = `48h` - `36h`,
+    FC_48h_72h = `72h` - `48h`,
+    FC_0m_1h  = `1h` - `0m`
+  )
+
+# Preview the new data with contrasts
+#glimpse(prot_data_contrasts)
+
+# Keep only the GeneID and the contrast columns from the data with computed contrasts
+prot_data_final_contrasts <- prot_data_contrasts %>%
+  select(GeneID, starts_with("FC_"))
+
+# Save the processed proteomics data as an RDS file
+saveRDS(prot_data_final_contrasts, "translation_on_demand/data/mm11/processed/processed_prot_data.rds")
+
+# -------------------------------
+# Gene Matching Between Datasets
+# -------------------------------
+# Get the list of common genes between RNA and proteomics contrasts
+common_genes <- intersect(rna_data$mgi_symbol, prot_data_final_contrasts$GeneID)
+cat("Number of common genes:", length(common_genes), "\n")
+
+# Filter the RNA data to keep only those genes present in the protein dataset
+rna_data_matched <- rna_data %>% 
+  filter(mgi_symbol %in% common_genes)
+
+cat("Matched RNA data has", nrow(rna_data_matched), "genes.\n")
+
+# Save the matched RNA data as an RDS file
+saveRDS(rna_data_matched, "translation_on_demand/data/mm11/processed/processed_rna_data_matched.rds")
